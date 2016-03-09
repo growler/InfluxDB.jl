@@ -1,7 +1,7 @@
 __precompile__()
 module InfluxDB
 
-export InfluxServer, create_db, query
+export InfluxServer, InfluxDB, create_db, query
 import Base: write
 
 using JSON
@@ -10,7 +10,7 @@ using DataFrames
 using Compat
 
 # A server that we will be communicating with
-type InfluxServer
+immutable InfluxServer
     # HTTP API endpoints
     addr::URI
 
@@ -33,8 +33,14 @@ type InfluxServer
         end
 
         # URIs are the new hotness
-        return new(uri, Nullable(username), Nullable(password))
+        return new(uri, convert(Nullable{AbstractString}, username), convert(Nullable{AbstractString}, password))
     end
+
+end
+
+immutable InfluxDatabase
+    server::InfluxServer
+    name::AbstractString
 end
 
 # Add authentication to a query dict, if we need to
@@ -45,6 +51,39 @@ function authenticate!(server::InfluxServer, query::Dict)
     end
 end
 
+function query(db::InfluxDatabase, qs::AbstractString; chunk_size::Integer = 10000, chunked = false)
+
+    query = Dict("db"=>db.name, "q"=>qs)
+    authenticate!(db.server, query)
+    if chunked then
+        query["chunked"] = "true"
+        query["chunk_size"] = string(chunk_size)
+    end
+
+    stream = get_streaming("$(db.server.addr)query"; query=query)
+    if stream.response.status != 200
+        error(bytestring(read(stream)))
+    end
+
+    ret = nothing
+    while !eof(stream)
+        jd = JSON.parse(stream)
+        if jd == nothing then
+            break
+        end
+        series_dict = jd["results"][1]["series"][1]
+        df = DataFrame()
+        for name_idx in 1:length(series_dict["columns"])
+            df[symbol(series_dict["columns"][name_idx])] = [x[name_idx] for x in series_dict["values"]]
+        end
+        if ret == nothing then
+            ret = df
+        else 
+            append!(ret, df)
+        end
+    end
+    return ret
+end
 
 # Grab a timeseries
 function query_series( server::InfluxServer, db::AbstractString, name::AbstractString;
@@ -66,6 +105,10 @@ function query_series( server::InfluxServer, db::AbstractString, name::AbstractS
     return df
 end
 
+function use_db(server::InfluxServer, db::AbstractString) 
+    InfluxDatabase(server, db)
+end
+
 # Create a database!
 function create_db(server::InfluxServer, db::AbstractString)
     query = Dict("q"=>"CREATE DATABASE \"$db\"")
@@ -74,6 +117,8 @@ function create_db(server::InfluxServer, db::AbstractString)
     response = get("$(server.addr)query"; query=query)
     if response.status != 200
         error(bytestring(response.data))
+    else
+	InfluxDatabase(server, db)
     end
 end
 
